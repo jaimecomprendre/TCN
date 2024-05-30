@@ -14,6 +14,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import librosa.display
 
+from TCN_models import TCN, TCNDiscriminator
+
+#select device
 if torch.cuda.is_available():
   device = "cuda"
 else:
@@ -21,122 +24,14 @@ else:
 
 name = 'model_0'
 
-
+#prepare the model directory
 if not os.path.exists('models/'+name):
     os.makedirs('models/'+name)
 else:
     print("A model with the same name already exists. Please choose a new name.")
     exit
 
-class TCNBlock(torch.nn.Module):
-  def __init__(self, in_channels, out_channels, kernel_size, dilation, activation=True):
-    super().__init__()
-    self.conv = torch.nn.Conv1d(
-        in_channels, 
-        out_channels, 
-        kernel_size, 
-        dilation=dilation, 
-        padding=0, #((kernel_size-1)//2)*dilation,
-        bias=True)
-    torch.nn.init.xavier_uniform_(self.conv.weight) # default is kaiming_uniform_(self.res.weight a=math.sqrt(5)) this equals U(−k,k), where k=groups/(Cin∗kernel_size) (cf. source code), but keras uses GlorotUniform which is xavier_uniform_; for timbral fx kaiming_uniform_ with! a=math.sqrt(5) seems to work better
-    torch.nn.init.zeros_(self.conv.bias) # also default is kaiming_uniform_(self.res.bias, a=math.sqrt(5)), see source code for implementation with small inchannels, but keras uses Zeros for bias
-    if activation:
-      # self.act = torch.nn.Tanh()
-      self.act = torch.nn.PReLU()
-    # this is the residual connection with 1x1 conv to match the channels and mix the desired amount of residual in
-    self.res = torch.nn.Conv1d(in_channels, out_channels, 1, bias=False)
-    torch.nn.init.xavier_uniform_(self.res.weight)
-    self.kernel_size = kernel_size
-    self.dilation = dilation
-
-  def forward(self, x):
-    x_in = x
-    x = self.conv(x)
-    if hasattr(self, "act"):
-      x = self.act(x)
-    x_res = self.res(x_in)
-    x_res = x_res[..., (self.kernel_size-1)*self.dilation:]
-    x = x + x_res
-    return x
-
-class TCN(torch.nn.Module):
-  def __init__(self, n_inputs=1, n_outputs=1, n_blocks=10, kernel_size=13, n_channels=64, dilation_growth=4):
-    super().__init__()
-    self.kernel_size = kernel_size
-    self.n_channels = n_channels
-    self.dilation_growth = dilation_growth
-    self.n_blocks = n_blocks
-    self.stack_size = n_blocks
-
-    self.blocks = torch.nn.ModuleList()
-    for n in range(n_blocks):
-      if n == 0:
-        in_ch = n_inputs
-        out_ch = n_channels
-        act = True
-      elif (n+1) == n_blocks:
-        in_ch = n_channels
-        out_ch = n_outputs
-        act = True
-      else:
-        in_ch = n_channels
-        out_ch = n_channels
-        act = True
-      
-      dilation = dilation_growth ** n
-      self.blocks.append(TCNBlock(in_ch, out_ch, kernel_size, dilation, activation=act))
-
-  def forward(self, x):
-    for block in self.blocks:
-      x = block(x)
-    return x
-  
-  def compute_receptive_field(self):
-    """Compute the receptive field in samples."""
-    rf = self.kernel_size
-    for n in range(1, self.n_blocks):
-        dilation = self.dilation_growth ** (n % self.stack_size)
-        rf = rf + ((self.kernel_size - 1) * dilation)
-    return rf
-
-class TCNDiscriminator(torch.nn.Module):
-    def __init__(self, n_inputs=1, n_outputs=1, n_blocks=10, kernel_size=13, n_channels=64, dilation_growth=4):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.n_channels = n_channels
-        self.dilation_growth = dilation_growth
-        self.n_blocks = n_blocks
-
-        self.blocks = torch.nn.ModuleList()
-        for n in range(n_blocks):
-            if n == 0:
-                in_ch = n_inputs
-                out_ch = n_channels
-                act = True
-            else:
-                in_ch = n_channels
-                out_ch = n_channels
-                act = True
-            
-            dilation = dilation_growth ** n
-            self.blocks.append(TCNBlock(in_ch, out_ch, kernel_size, dilation, activation=act))
-
-        self.global_avg_pool = torch.nn.AdaptiveAvgPool1d(1)
-        self.fc = torch.nn.Linear(n_channels, n_outputs)
-        # self.sigmoid = torch.nn.Sigmoid()
-        # self.re= torch.nn.ReLU()
-
-    def forward(self, x):
-        for block in self.blocks:
-            x = block(x)
-        x = self.global_avg_pool(x)
-        x = x.squeeze(-1)  # remove the time dimension
-        x = self.fc(x)
-        # x = self.sigmoid(x)
-        return x
-  
-
-#@title Use pre-loaded audio examples for steering
+# choose the effect type
 effect_type = "Reverb" #@param ["Compressor", "Reverb", "UltraTab", "Amp"]
 
 if effect_type == "Compressor":
@@ -152,6 +47,7 @@ elif effect_type == "Amp":
   input_file = "audio/ts9_test1_in_FP32.wav"
   output_file = "audio/ts9_test1_out_FP32.wav"
 
+#load audio
 x, sample_rate = torchaudio.load(input_file)
 y, sample_rate = torchaudio.load(output_file)
 
@@ -339,16 +235,15 @@ print("done")
 
 import torch.optim as optim
 from copy import deepcopy
-# Define the Generator (TCN)
-generator = (deepcopy(model)).to(device)
+
 # Define the Discriminator
 discriminator = TCNDiscriminator(
     n_inputs=1,
     n_outputs=1,
-    kernel_size=13, 
-    n_blocks=4, 
-    dilation_growth=10, 
-    n_channels=32)
+    kernel_size=kernel_size, 
+    n_blocks=n_blocks, 
+    dilation_growth=dilation_growth, 
+    n_channels=n_channels)
 
 
 summary = torchinfo.summary(discriminator, (1, 1, 226976), device=device)
@@ -368,16 +263,9 @@ milestones = [ms1, ms2]
 # this is only for the progress 
 pbar = tqdm(range(num_epochs))
 
-g_learning_rate=0.0001
 d_learning_rate=0.0001
 
-generator_optimizer = optim.Adam(generator.parameters(), lr=g_learning_rate)
-generator_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-    generator_optimizer,
-    milestones=milestones,
-    gamma=0.1,
-    verbose=False
-)
+
 discriminator_optimizer = optim.Adam(discriminator.parameters(), lr=d_learning_rate)
 discriminator_scheduler = torch.optim.lr_scheduler.MultiStepLR(
     discriminator_optimizer,
@@ -394,14 +282,10 @@ y_crop.to(device)
 
 for epoch in pbar:
     # Generate fake data using the TCN (generator)
-    discriminator.train()
-    generator.train()
-    # real_labels = torch.ones(1, 1).to(device)
-    # fake_labels = torch.zeros(1, 1).to(device)
     
     discriminator_optimizer.zero_grad()
     with torch.no_grad():
-        fake_data = generator(x_crop)
+        fake_data = model(x_crop)
         fake_data.to(device)
     real_predictions = discriminator(y_crop)
     real_predictions.to(device)
@@ -419,8 +303,8 @@ for epoch in pbar:
     discriminator_scheduler.step()
 
     # Train the generator
-    generator_optimizer.zero_grad()
-    fake_data = generator(x_crop)
+    optimizer.zero_grad()
+    fake_data = model(x_crop)
     fake_predictions = discriminator(fake_data)
     fake_predictions.to(device)
 
@@ -428,8 +312,7 @@ for epoch in pbar:
     generator_loss = -fake_predictions + distance
     generator_loss.backward()
     g_losses.append(generator_loss.item()) 
-    generator_optimizer.step()
-    generator_scheduler.step()
+    optimizer.step()
     if (n+1) % 1 == 0:
       pbar.set_description(f" GLoss: {generator_loss.item()} | DLoss: {discriminator_loss.item()} | loss: {loss_fn_mse(fake_data, y_crop)}")
     # print(f"Epoch {epoch} | Discriminator Loss: {discriminator_loss.item()} | Generator Loss: {generator_loss.item()}")
